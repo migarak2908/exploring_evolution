@@ -95,7 +95,7 @@ def get_init_state_fn(key: jnp.ndarray, SX, SY, posx, posy, pos_food_x, pos_food
     grid = grid.at[:, -1, 2].set(1)
 
     # initialise infants
-    grid = grid.at[:, :, 3].set(0)
+    grid = grid.at[posx, posy, 3].set(1)
 
     #initialise_gradient
 
@@ -141,6 +141,10 @@ class Gridworld(VectorizedTask):
                  niches_scale=200,
                  spontaneous_regrow=1 / 200000,
                  wall_kill=True,
+                 infant_move_prob=1.0,
+                 infant_eat_prop=1.0,
+                 infant_eat_prob=1.0,
+                 infant_threshold=100
                  ):
         # self.obs_shape = (AGENT_VIEW, AGENT_VIEW, obs_channels)
         # self.obs_shape=11*5*4
@@ -166,6 +170,11 @@ class Gridworld(VectorizedTask):
         self.place_resources = place_resources
         self.params = params
         self.reproduction_on = reproduction_on
+
+        self.infant_move_prob = infant_move_prob
+        self.infant_eat_prop = infant_eat_prop
+        self.infant_eat_prob = infant_eat_prob
+        self.infant_threshold = infant_threshold
 
         def reset_fn(key):
 
@@ -244,7 +253,7 @@ class Gridworld(VectorizedTask):
                                  parent_id=parent_id
                                  )
 
-            return State(state=grid, obs=get_obs_vector(grid, posx, posy), last_actions=jnp.zeros((self.nb_agents, 5)),
+            return State(state=grid, obs=get_obs_vector(grid, posx, posy), last_actions=jnp.zeros((self.nb_agents, NUM_ACTIONS)),
                          rewards=jnp.zeros((self.nb_agents, 1)), agents=agents,
                          steps=jnp.zeros((), dtype=int), key=next_key, next_uid=next_uid)
 
@@ -347,13 +356,27 @@ class Gridworld(VectorizedTask):
             # add only the alive
             grid = grid.at[posx, posy, 0].add(1 * (alive > 0))
 
+            # identify infants
+
+            is_infant = state.agents.time_alive < self.infant_threshold
+            # TODO: Update is_infant grid channel
+
             ### collect food
 
             # TODO: Implement infant eat success probability and infant food energy proportion
 
             rewards = (alive > 0) * (grid[posx, posy, 1] > 0) * (1 / (grid[posx, posy, 0] + 1e-10))
             rewards = rewards * action_int[:, 4]
-            grid = grid.at[posx, posy, 1].add(-1 * (alive > 0) * action_int[:, 4])
+
+            next_key, key = jax.random.split(key)
+            ie_prop = self.infant_eat_prop
+            ie_prob = self.infant_eat_prob
+
+            eat_success = jax.random.bernoulli(next_key, ie_prob,shape=(self.nb_agents,))
+            rewards = jnp.where(is_infant,  rewards * eat_success * ie_prop, rewards)
+
+            grid = grid.at[posx, posy, 1].add(jnp.where((rewards > 0.0), -1, 0))
+
             grid = grid.at[:, :, 1].set(jnp.clip(grid[:, :, 1], 0, 1))
 
             nb_food = state.agents.nb_food + rewards
@@ -364,7 +387,7 @@ class Gridworld(VectorizedTask):
                                                       mode="same")
             scale = grid[:, :, 4]
             scale_constant = regrowth_scale
-            next_key, key = random.split(state.key)
+            next_key, key = random.split(key)
 
             if scale_constant:
 
@@ -416,6 +439,9 @@ class Gridworld(VectorizedTask):
 
             done = False
             steps = jnp.where(done, jnp.zeros((), jnp.int32), steps)
+
+            # TODO: Add orientaiton, uid, parent_id, next_iud to State.
+
             cur_state = State(state=grid, obs=get_obs_vector(grid, posx, posy), last_actions=actions,
                               rewards=jnp.expand_dims(rewards, -1),
                               agents=AgentStates(posx=posx, posy=posy, energy=energy, time_good_level=time_good_level,
