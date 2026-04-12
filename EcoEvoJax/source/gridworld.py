@@ -144,7 +144,8 @@ class Gridworld(VectorizedTask):
                  infant_move_prob=1.0,
                  infant_eat_prop=1.0,
                  infant_eat_prob=1.0,
-                 infant_threshold=100
+                 infant_threshold=100,
+                 feeding_transfer=0.2
                  ):
         # self.obs_shape = (AGENT_VIEW, AGENT_VIEW, obs_channels)
         # self.obs_shape=11*5*4
@@ -175,6 +176,7 @@ class Gridworld(VectorizedTask):
         self.infant_eat_prop = infant_eat_prop
         self.infant_eat_prob = infant_eat_prob
         self.infant_threshold = infant_threshold
+        self.feeding_transfer = feeding_transfer
 
         def reset_fn(key):
 
@@ -335,6 +337,28 @@ class Gridworld(VectorizedTask):
             # move agent
             action_int = actions.astype(jnp.int32)
 
+            # feeding mechanism
+
+            curr_pos_x = state.agents.posx
+            curr_pos_y = state.agents.posy
+
+            feed_pos_x = curr_pos_x + DX[state.agents.orientation]
+            feed_pos_y = curr_pos_y + DY[state.agents.orientation]
+
+            x_match = (feed_pos_x[:, None] == curr_pos_x[None, :])
+            y_match = (feed_pos_y[:, None] == curr_pos_y[None, :])
+
+            success_feed = x_match & y_match
+
+            can_feed = (alive[:, None] > 0) * (action_int[:, 5][:, None])
+            can_receive = (alive[None, :] > 0)
+
+            valid_feed = success_feed & can_feed & can_receive
+
+            energy = jnp.where(valid_feed.any(axis=1), energy - feeding_transfer, energy)
+            energy = jnp.where(valid_feed.any(axis=0), energy + feeding_transfer, energy)
+
+
             # TODO: Implement infant move probability
 
             posx = state.agents.posx + (DX[state.agents.orientation] * action_int[:, 1])
@@ -359,11 +383,11 @@ class Gridworld(VectorizedTask):
             # identify infants
 
             is_infant = state.agents.time_alive < self.infant_threshold
-            # TODO: Update is_infant grid channel
+            grid = grid.at[state.agents.posx, state.agents.posy, 3].set(0)
+            grid = grid.at[posx, posy, 3].add(is_infant.astype(jnp.int32) * (alive > 0))
+            grid = grid.at[:, :, 3].set(jnp.clip(grid[:, :, 3], 0, 1))
 
             ### collect food
-
-            # TODO: Implement infant eat success probability and infant food energy proportion
 
             rewards = (alive > 0) * (grid[posx, posy, 1] > 0) * (1 / (grid[posx, posy, 0] + 1e-10))
             rewards = rewards * action_int[:, 4]
@@ -372,7 +396,7 @@ class Gridworld(VectorizedTask):
             ie_prop = self.infant_eat_prop
             ie_prob = self.infant_eat_prob
 
-            eat_success = jax.random.bernoulli(next_key, ie_prob,shape=(self.nb_agents,))
+            eat_success = jax.random.bernoulli(next_key, ie_prob, shape=(self.nb_agents,))
             rewards = jnp.where(is_infant,  rewards * eat_success * ie_prop, rewards)
 
             grid = grid.at[posx, posy, 1].add(jnp.where((rewards > 0.0), -1, 0))
@@ -412,8 +436,6 @@ class Gridworld(VectorizedTask):
             # decay of energy and clipping
             energy = energy - self.energy_decay + rewards
             energy = jnp.clip(energy, -1000, self.max_ener)
-
-            # TODO: Implement feeding mechanism
 
             time_good_level = jnp.where(energy > 0, (state.agents.time_good_level + 1) * alive, 0)
 
