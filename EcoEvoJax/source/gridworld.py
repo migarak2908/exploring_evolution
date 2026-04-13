@@ -262,7 +262,7 @@ class Gridworld(VectorizedTask):
         self._reset_fn = jax.jit(reset_fn)
 
         def reproduce(params, posx, posy, energy, time_good_level, key, policy_states, time_alive, alive, nb_food,
-                      nb_offspring):
+                      nb_offspring, action_int):
             # use agent 0 to 4 as a dump always dead if no dead put in there to be sure not overiding the alive ones
             # but maybe better to just make sure that there are 5 places available by checking if 5 dead (but this way may be better if we augment the 5)
             dead = 1 - alive
@@ -275,7 +275,7 @@ class Gridworld(VectorizedTask):
 
             # compute reproducer spot
             next_key, key = random.split(key)
-            reproducer = jnp.where(time_good_level > self.time_reproduce, 1, 0)
+            reproducer = jnp.where(time_good_level > self.time_reproduce, 1, 0) * action_int[:, 6]
             reproducer = reproducer.at[0:5].set(0.001)
             reproducer_spots = jax.random.choice(next_key, jnp.arange(time_good_level.shape[0]),
                                                  p=reproducer / (reproducer.sum() + 1e-10), replace=False, shape=(5,))
@@ -334,8 +334,11 @@ class Gridworld(VectorizedTask):
             energy = state.agents.energy
             alive = state.agents.alive
 
-            # move agent
+            # obtain actions
             action_int = actions.astype(jnp.int32)
+
+            # identify infants
+            is_infant = state.agents.time_alive < self.infant_threshold
 
             # feeding mechanism
 
@@ -355,18 +358,22 @@ class Gridworld(VectorizedTask):
 
             valid_feed = success_feed & can_feed & can_receive
 
-            energy = jnp.where(valid_feed.any(axis=1), energy - feeding_transfer, energy)
-            energy = jnp.where(valid_feed.any(axis=0), energy + feeding_transfer, energy)
+            energy = jnp.where(valid_feed.any(axis=1), energy - self.feeding_transfer, energy)
+            energy = jnp.where(valid_feed.any(axis=0), energy + self.feeding_transfer, energy)
 
 
-            # TODO: Implement infant move probability
+            # move agent
 
-            posx = state.agents.posx + (DX[state.agents.orientation] * action_int[:, 1])
-            posy = state.agents.posy + (DY[state.agents.orientation] * action_int[:, 1])
+            next_key, key = jax.random.split(key)
+            infant_move = jnp.where(is_infant, jax.random.bernoulli(next_key, self.infant_move_prob, (nb_agents,)) ,1)
+
+            posx = state.agents.posx + (DX[state.agents.orientation] * action_int[:, 1] * infant_move)
+            posy = state.agents.posy + (DY[state.agents.orientation] * action_int[:, 1] * infant_move)
 
             orientation = (state.agents.orientation + action_int[:, 2] - action_int[:, 3]) % 4
 
             # wall
+
             hit_wall = state.state[posx, posy, 2] > 0
             if (wall_kill):
                 alive = jnp.where(hit_wall, 0, alive)
@@ -378,16 +385,10 @@ class Gridworld(VectorizedTask):
             grid = grid.at[state.agents.posx, state.agents.posy, 0].set(0)
 
             # add only the alive
+
             grid = grid.at[posx, posy, 0].add(1 * (alive > 0))
 
-            # identify infants
-
-            is_infant = state.agents.time_alive < self.infant_threshold
-            grid = grid.at[state.agents.posx, state.agents.posy, 3].set(0)
-            grid = grid.at[posx, posy, 3].add(is_infant.astype(jnp.int32) * (alive > 0))
-            grid = grid.at[:, :, 3].set(jnp.clip(grid[:, :, 3], 0, 1))
-
-            ### collect food
+            # collect food
 
             rewards = (alive > 0) * (grid[posx, posy, 1] > 0) * (1 / (grid[posx, posy, 0] + 1e-10))
             rewards = rewards * action_int[:, 4]
@@ -445,16 +446,19 @@ class Gridworld(VectorizedTask):
 
             time_alive = jnp.where(alive > 0, time_alive + 1, 0)
 
-            # TODO: Implement manual reproduction
+            # Update infants
+            grid = grid.at[state.agents.posx, state.agents.posy, 3].set(0)
+            grid = grid.at[posx, posy, 3].add(is_infant.astype(jnp.int32) * (alive > 0))
+            grid = grid.at[:, :, 3].set(jnp.clip(grid[:, :, 3], 0, 1))
 
             # compute reproducer and go through the function only if there is one
-            reproducer = jnp.where(state.agents.time_good_level > self.time_reproduce, 1, 0)
+            reproducer = jnp.where(state.agents.time_good_level > self.time_reproduce, 1, 0) * action_int[:, 6]
             next_key, key = random.split(key)
             params, posx, posy, energy, time_good_level, policy_states, time_alive, alive, nb_food, nb_offspring = jax.lax.cond(
-                reproducer.sum() > 0, reproduce, lambda y, z, a, b, c, d, e, f, g, h, i: (y, z, a, b, c, e, f, g, h, i),
+                reproducer.sum() > 0, reproduce, lambda y, z, a, b, c, d, e, f, g, h, i, j: (y, z, a, b, c, e, f, g, h, i),
                 *(
                     state.agents.params, posx, posy, energy, time_good_level, next_key, state.agents.policy_states,
-                    time_alive, alive, nb_food, state.agents.nb_offspring))
+                    time_alive, alive, nb_food, state.agents.nb_offspring, action_int))
 
             time_under_level = jnp.where(energy < 0, state.agents.time_under_level + 1, 0)
             alive = jnp.where(jnp.logical_or(time_alive > self.max_age, time_under_level > self.time_death), 0, alive)
