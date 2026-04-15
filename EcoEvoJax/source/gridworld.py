@@ -269,13 +269,47 @@ class Gridworld(VectorizedTask):
 
 
         def reproduce(params, posx, posy, energy, time_good_level, key, policy_states, time_alive, alive, nb_food,
-                      nb_offspring, action_int, uid, parent_id, next_uid):
+                      nb_offspring, action_int, uid, parent_id, next_uid, grid):
 
             reproducer_mask = (time_good_level > self.time_reproduce) * action_int[:, 6] * (alive > 0)
             dead_mask = (1 - alive)
 
             reprod_rank = jnp.cumsum(reproducer_mask) * reproducer_mask
-            death_rank = jnp.cumsum(dead_mask) * dead_mask
+            dead_rank = jnp.cumsum(dead_mask) * dead_mask
+
+            match = (dead_rank[:, None] == reprod_rank[None, :]) & \
+                    (dead_rank[:, None] > 0) & \
+                    (dead_rank[:, None] <= jnp.minimum(dead_rank.max(), reprod_rank.max()))
+
+
+            parent_idx = jnp.argmax(match, axis=1)
+            is_filled = match.any(axis=1)
+
+            if self.proximal_reprod:
+                candidate_x = jnp.clip(posx[:, None] + SEARCH_OFFSETS[None, :, 0], 1, SX - 2)
+                candidate_y = jnp.clip(posy[:, None] + SEARCH_OFFSETS[None, :, 1], 1, SY - 2)
+                occupied = grid[candidate_x, candidate_y, 0] > 0
+                first_empty = jnp.argmin(occupied, axis=1)
+                spawn_x = candidate_x[jnp.arange(nb_agents), first_empty]
+                spawn_y = candidate_y[jnp.arange(nb_agents), first_empty]
+
+            else:
+                next_key, key = jax.random.split(key)
+                spawn_x = random.randint(next_key, (nb_agents,), 1, SX - 2)
+                next_key, key = jax.random.split(key)
+                spawn_y = random.randint(next_key, (nb_agents,), 1, SY - 2)
+
+            offspring_x = spawn_x[parent_idx]
+            offspring_y = spawn_y[parent_idx]
+            is_filled = is_filled & (grid[offspring_x, offspring_y, 0] == 0)
+
+
+
+
+
+
+
+
 
             # TODO: match see where reprod_rank and death_rank match up, death_rank > 0 and take the min of the highest value from either
 
