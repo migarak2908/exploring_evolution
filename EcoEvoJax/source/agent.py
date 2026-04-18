@@ -16,12 +16,14 @@ from evojax.util import create_logger
 from evojax.util import get_params_format_fn
 
 
+
 class MetaRNN_bcppr(nn.Module):
     output_size: int
     out_fn: str
     hidden_layers: list
     encoder_in: bool
     encoder_layers: list
+    use_lstm: bool
 
     def setup(self):
 
@@ -53,9 +55,14 @@ class MetaRNN_bcppr(nn.Module):
 
         inputs_encoded = jnp.concatenate([out, last_action, reward])
 
-        for _ in range(self._num_micro_ticks):
-            carry, out = self._lstm(carry, inputs_encoded)
-        out = jnp.concatenate([inputs_encoded, out])
+        if self.use_lstm:
+            for _ in range(self._num_micro_ticks):
+                carry, out = self._lstm(carry, inputs_encoded)
+            out = jnp.concatenate([inputs_encoded, out])
+        else:
+            out = inputs_encoded
+            carry = (h, c)
+
         for layer in self._hiddens:
             out = jax.nn.tanh(layer(out))
         out = self._output_proj(out)
@@ -88,6 +95,7 @@ class MetaRnnPolicy_bcppr(PolicyNetwork):
                  hidden_layers: list = [],
                  encoder: bool = False,
                  encoder_layers: list = [32, 32],
+                 use_lstm: bool = True,
                  logger: logging.Logger = None):
 
         if logger is None:
@@ -95,7 +103,7 @@ class MetaRnnPolicy_bcppr(PolicyNetwork):
         else:
             self._logger = logger
         model = MetaRNN_bcppr(output_dim, out_fn=output_act_fn, hidden_layers=hidden_layers, encoder_in=encoder,
-                              encoder_layers=encoder_layers)
+                              encoder_layers=encoder_layers, use_lstm=use_lstm)
         self.params = model.init(jax.random.PRNGKey(0), jnp.zeros((hidden_dim)), jnp.zeros((hidden_dim)),
                                  jnp.zeros(input_dim), jnp.zeros([output_dim]), jnp.zeros([1]))
 

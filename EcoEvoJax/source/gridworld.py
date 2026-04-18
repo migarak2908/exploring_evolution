@@ -138,6 +138,7 @@ class Gridworld(VectorizedTask):
                  proximal_reprod=True,
                  place_resources=False,
                  place_agent=False,
+                 use_lstm=True,
                  params=None,
                  test: bool = False,
                  energy_decay=0.05,
@@ -164,7 +165,7 @@ class Gridworld(VectorizedTask):
         self.SY = SY
         self.energy_decay = energy_decay
         self.model = MetaRnnPolicy_bcppr(input_dim=((AGENT_VIEW * 2 + 1), (AGENT_VIEW * 2 + 1), obs_channels), hidden_dim=4,
-                                         output_dim=action_space, encoder_layers=[], hidden_layers=[8])
+                                         output_dim=action_space, encoder_layers=[], hidden_layers=[8], use_lstm=use_lstm)
 
         self.energy_decay = energy_decay
         self.max_age = max_age
@@ -177,6 +178,7 @@ class Gridworld(VectorizedTask):
         self.spontaneous_regrow = spontaneous_regrow
         self.place_agent = place_agent
         self.place_resources = place_resources
+        self.use_lstm = use_lstm
         self.params = params
         self.reproduction_on = reproduction_on
         self.proximal_reprod = proximal_reprod
@@ -549,12 +551,6 @@ class Gridworld(VectorizedTask):
              ) -> Tuple[State, jnp.ndarray, jnp.ndarray]:
         return self._step_fn(state)
 
-
-
-# TODO 5: Agent architecture ablation
-#   - Add use_lstm: bool flag to MetaRNN_bcppr
-#   - In __call__: bypass LSTM cell when use_lstm=False, pass inputs_encoded directly to hidden layers
-#   - Thread use_lstm through MetaRnnPolicy_bcppr constructor
 
 # TODO 7: Metrics
 #   - Infant survival rate: track fraction of infants (time_alive < threshold) that reach adulthood
