@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from functools import partial
+
 from typing import Tuple
 from PIL import Image
 from PIL import ImageDraw
@@ -26,7 +26,7 @@ import math
 
 
 AGENT_VIEW = 5
-GRID_CHANNELS = 5
+GRID_CHANNELS = 6
 OBS_CHANNELS = 5
 NUM_ACTIONS = 7
 
@@ -39,7 +39,7 @@ from evojax.policy.base import PolicyState
 from evojax.task.base import TaskState
 from evojax.task.base import VectorizedTask
 
-_offsets = sorted([(dx, dy) for dx in range(-5, 6) for dy in range(-5,6) if not dx == 0 and dy == 0],
+_offsets = sorted([(dx, dy) for dx in range(-5, 6) for dy in range(-5,6) if not (dx == 0 and dy == 0)],
                  key= lambda o: o[0]**2 + o[1]**2)
 
 SEARCH_OFFSETS = jnp.array(_offsets)
@@ -67,7 +67,7 @@ class State(TaskState):
     obs: jnp.int8
     last_actions: jnp.int8
     rewards: jnp.int8
-    state: jnp.int8
+    state: jnp.int32
     agents: AgentStates
     steps: jnp.int32
     key: jnp.ndarray
@@ -77,7 +77,7 @@ class State(TaskState):
 def get_ob(state: jnp.ndarray, pos_x: jnp.int32, pos_y: jnp.int32) -> jnp.ndarray:
     obs = (jax.lax.dynamic_slice(jnp.pad(state, ((AGENT_VIEW, AGENT_VIEW), (AGENT_VIEW, AGENT_VIEW), (0, 0))),
                                  (pos_x - AGENT_VIEW + AGENT_VIEW, pos_y - AGENT_VIEW + AGENT_VIEW, 0),
-                                 (2 * AGENT_VIEW + 1, 2 * AGENT_VIEW + 1, OBS_CHANNELS-1)))
+                                 (2 * AGENT_VIEW + 1, 2 * AGENT_VIEW + 1, OBS_CHANNELS)))
 
     return obs
 
@@ -87,7 +87,6 @@ def get_init_state_fn(key: jnp.ndarray, SX, SY, posx, posy, pos_food_x, pos_food
 
     # initialise agents
     grid = grid.at[posx, posy, 0].add(1)
-    grid = grid.at[posx[:5], posy[:5], 0].set(0)
 
     # initialise food
     grid = grid.at[pos_food_x, pos_food_y, 1].set(1)
@@ -101,7 +100,11 @@ def get_init_state_fn(key: jnp.ndarray, SX, SY, posx, posy, pos_food_x, pos_food
     # initialise infants
     grid = grid.at[posx, posy, 3].set(1)
 
-    #initialise_gradient
+    # initialise parent_ids
+
+    grid = grid.at[:, :, 4].set(0)
+
+    # initialise_gradient
 
     new_array = jnp.clip(
         np.asarray([(math.pow(niches_scale, el) - 1) / (niches_scale - 1) for el in np.arange(0, SX) / SX]), 0,
@@ -113,7 +116,7 @@ def get_init_state_fn(key: jnp.ndarray, SX, SY, posx, posy, pos_food_x, pos_food
 
         new_array = jnp.append(new_array, new_col)
     new_array = jnp.transpose(jnp.reshape(new_array, (SY, SX)))
-    grid = grid.at[:, :, 4].set(new_array)
+    grid = grid.at[:, :, 5].set(new_array)
 
     return (grid)
 
@@ -248,7 +251,7 @@ class Gridworld(VectorizedTask):
             next_uid = nb_agents+1
 
             agents = AgentStates(posx=posx, posy=posy, orientation=orientation,
-                                 energy=self.max_ener * jnp.ones((self.nb_agents,)).at[0:5].set(0),
+                                 energy=self.max_ener * jnp.ones((self.nb_agents,)),
                                  time_good_level=jnp.zeros((self.nb_agents,), dtype=jnp.uint16), params=params,
                                  policy_states=policy_states,
                                  time_alive=jnp.zeros((self.nb_agents,), dtype=jnp.uint16),
@@ -261,7 +264,11 @@ class Gridworld(VectorizedTask):
                                  parent_id=parent_id
                                  )
 
-            return State(state=grid, obs=get_obs_vector(grid, posx, posy), last_actions=jnp.zeros((self.nb_agents, NUM_ACTIONS)),
+            raw_obs = get_obs_vector(grid, posx, posy)
+            is_offspring = (raw_obs[:, :, :, 4] == uid[:, None, None]).astype(jnp.int32)
+            obs = raw_obs.at[:, :, :, 4].set(is_offspring)
+
+            return State(state=grid, obs=obs, last_actions=jnp.zeros((self.nb_agents, NUM_ACTIONS)),
                          rewards=jnp.zeros((self.nb_agents, 1)), agents=agents,
                          steps=jnp.zeros((), dtype=int), key=next_key, next_uid=next_uid)
 
@@ -303,77 +310,50 @@ class Gridworld(VectorizedTask):
             offspring_y = spawn_y[parent_idx]
             is_filled = is_filled & (grid[offspring_x, offspring_y, 0] == 0)
 
+            same_cell = (offspring_x[:, None] == offspring_x[None, :]) & \
+                        (offspring_y[:, None] == offspring_y[None, :]) & \
+                        is_filled[:, None] & is_filled[None, :]
 
+            is_loser = (same_cell & (jnp.arange(nb_agents)[:, None] > jnp.arange(nb_agents)[None, :])).any(axis=1)
 
+            is_filled = is_filled & ~is_loser
 
+            n_births = is_filled.sum()
 
+            parent_uid = uid[parent_idx]
+            offspring_uid = next_uid + jnp.where(is_filled, jnp.cumsum(is_filled) - 1, 0)
+            uid = jnp.where(is_filled, offspring_uid, uid)
+            parent_id = jnp.where(is_filled, parent_uid, parent_id)
+            next_uid = next_uid + n_births.astype(jnp.uint32)
 
+            next_key, key = random.split(key)
+            if self.reproduction_on:
+                mutated = params[parent_idx] + 0.02 * jax.random.normal(next_key, params.shape)
+                params = jnp.where(is_filled[:, None], mutated, params)
 
+            posx = jnp.where(is_filled, offspring_x, posx)
+            posy = jnp.where(is_filled, offspring_y, posy)
+            energy = jnp.where(is_filled, self.max_ener, energy)
+            time_good_level = jnp.where(is_filled, 0, time_good_level)
+            alive = jnp.where(is_filled, 1, alive)
+            time_alive = jnp.where(is_filled, 0, time_alive)
+            nb_food = jnp.where(is_filled, 0, nb_food)
+            nb_offspring = jnp.where(is_filled, 0, nb_offspring)
 
+            policy_states = metaRNNPolicyState_bcppr(
+                lstm_h=jnp.where(is_filled[:, None], jnp.zeros_like(policy_states.lstm_h), policy_states.lstm_h),
+                lstm_c=jnp.where(is_filled[:, None], jnp.zeros_like(policy_states.lstm_c), policy_states.lstm_c),
+                keys=policy_states.keys
+            )
 
-            # TODO: match see where reprod_rank and death_rank match up, death_rank > 0 and take the min of the highest value from either
+            actually_reproduced = reproducer_mask & (reprod_rank <= n_births)
+            nb_offspring = nb_offspring + actually_reproduced.astype(jnp.int32)
 
+            time_good_level = jnp.where(actually_reproduced, 0, time_good_level)
 
-        # TODO: Add uid, parent_id, next_uid
-        # TODO: Add flag for proximate and random placement of offspring
-        # def reproduce(params, posx, posy, energy, time_good_level, key, policy_states, time_alive, alive, nb_food,
-        #               nb_offspring, action_int, uid, parent_id, next_uid ):
-        #     # use agent 0 to 4 as a dump always dead if no dead put in there to be sure not overiding the alive ones
-        #     # but maybe better to just make sure that there are 5 places available by checking if 5 dead (but this way may be better if we augment the 5)
-        #     dead = 1 - alive
-        #     dead = dead.at[0:5].set(0.001)
-        #
-        #     next_key, key = random.split(key)
-        #     # empty_spots for new agent are dead ones
-        #     empty_spots = jax.random.choice(next_key, jnp.arange(time_good_level.shape[0]), p=dead, replace=False,
-        #                                     shape=(5,))
-        #
-        #     # compute reproducer spot
-        #     next_key, key = random.split(key)
-        #     reproducer = jnp.where(time_good_level > self.time_reproduce, 1, 0) * action_int[:, 6]
-        #     reproducer = reproducer.at[0:5].set(0.001)
-        #     reproducer_spots = jax.random.choice(next_key, jnp.arange(time_good_level.shape[0]),
-        #                                          p=reproducer / (reproducer.sum() + 1e-10), replace=False, shape=(5,))
-        #
-        #     next_key, key = random.split(key)
-        #     params = params
-        #     # new agents params with mutate , and also take pos of parents
-        #     if self.reproduction_on:
-        #         params = params.at[empty_spots].set(
-        #             params[reproducer_spots] + 0.02 * jax.random.normal(next_key, (5, params.shape[1])))
-        #         posx = posx.at[empty_spots].set(posx[reproducer_spots])
-        #         posy = posy.at[empty_spots].set(posy[reproducer_spots])
-        #
-        #     # new agents energy set at max
-        #
-        #     # multiply by reproducer to be sure that the one that got selected by reproducer spot were reproducer indeed,
-        #     # in case nb reproducer <5 but again maybe we can just check that at least 5 reproducer but weird
-        #     energy = energy.at[empty_spots].set(self.max_ener * reproducer[reproducer_spots])
-        #     energy = energy.at[0:5].set(0.)
-        #
-        #     # new agents alive and time alive , time_good_alive, and RNN state set at 0
-        #
-        #     alive = alive.at[empty_spots].set(1 * reproducer[reproducer_spots])
-        #     time_alive = time_alive.at[empty_spots].set(0)
-        #     nb_food = nb_food.at[empty_spots].set(0)
-        #     nb_offspring = nb_offspring.at[empty_spots].set(0)
-        #     nb_offspring = nb_offspring.at[reproducer_spots].add((empty_spots > 4))
-        #     time_good_level = time_good_level.at[empty_spots].set(0)
-        #     policy_states = metaRNNPolicyState_bcppr(
-        #         lstm_h=policy_states.lstm_h.at[empty_spots].set(jnp.zeros(policy_states.lstm_h.shape[1])),
-        #         lstm_c=policy_states.lstm_c.at[empty_spots].set(jnp.zeros(policy_states.lstm_c.shape[1])),
-        #         keys=policy_states.keys)
-        #
-        #     # put time good level of reproducer back to 0
-        #     # if in the dump don't put to 0 so that they can try reproduce in the next timestep
-        #     time_good_level = time_good_level.at[reproducer_spots].set(
-        #         time_good_level[reproducer_spots] * (empty_spots < 5))
-        #
-        #     # kill the dump
-        #     alive = alive.at[0:5].set(0)
-        #
-        #     return (
-        #     params, posx, posy, energy, time_good_level, policy_states, time_alive, alive, nb_food, nb_offspring)
+            return (params, posx, posy, energy, time_good_level, policy_states, time_alive,
+                    alive, nb_food, nb_offspring, uid, parent_id, next_uid)
+
 
         def step_fn(state):
             key = state.key
@@ -439,6 +419,21 @@ class Gridworld(VectorizedTask):
             posy = jnp.clip(posy, 0, SY - 1)
             grid = grid.at[state.agents.posx, state.agents.posy, 0].set(0)
 
+            #precedence and takes the position.
+            next_key, key = jax.random.split(key)
+            priority = jax.random.uniform(next_key, (nb_agents, ), 0.0, 1.0)
+
+            candidate_posx = (posx[:, None] == posx[None, :])
+            candidate_posy = (posy[:, None] == posy[None, :])
+            overlap = candidate_posx & candidate_posy & (alive[:, None] > 0) & (alive[None, :] > 0)
+
+            not_self = jnp.arange(nb_agents)[:, None] != jnp.arange(nb_agents)[None, :]
+            is_loser = overlap & not_self & (priority[:, None] < priority[None, :])
+            is_loser = is_loser.any(axis=1)
+
+            posx = jnp.where(is_loser, state.agents.posx, posx)
+            posy = jnp.where(is_loser, state.agents.posy, posy)
+
             # add only the alive
 
             grid = grid.at[posx, posy, 0].add(1 * (alive > 0))
@@ -465,7 +460,7 @@ class Gridworld(VectorizedTask):
 
             num_neighbs = jax.scipy.signal.convolve2d(grid[:, :, 1], jnp.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]]),
                                                       mode="same")
-            scale = grid[:, :, 4]
+            scale = grid[:, :, 5]
             scale_constant = regrowth_scale
             next_key, key = random.split(key)
 
@@ -507,25 +502,31 @@ class Gridworld(VectorizedTask):
             grid = grid.at[:, :, 3].set(jnp.clip(grid[:, :, 3], 0, 1))
 
             # compute reproducer and go through the function only if there is one
-            reproducer = jnp.where(state.agents.time_good_level > self.time_reproduce, 1, 0) * action_int[:, 6]
+            reproducer = jnp.where(time_good_level > self.time_reproduce, 1, 0) * action_int[:, 6]
             uid, parent_id, next_uid = state.agents.uid, state.agents.parent_id, state.next_uid
             next_key, key = random.split(key)
 
 
             params, posx, posy, energy, time_good_level, policy_states, time_alive, alive, nb_food, nb_offspring, uid, parent_id, next_uid = jax.lax.cond(
-                reproducer.sum() > 0, reproduce, lambda y, z, a, b, c, d, e, f, g, h, i, j, k, l, m: (y, z, a, b, c, e, f, g, h, i, k, l, m),
+                reproducer.sum() > 0, reproduce, lambda y, z, a, b, c, d, e, f, g, h, i, j, k, l, m, n: (y, z, a, b, c, e, f, g, h, i, k, l, m),
                 *(
-                    state.agents.params, posx, posy, energy, time_good_level, next_key, state.agents.policy_states,
-                    time_alive, alive, nb_food, state.agents.nb_offspring, action_int, uid, parent_id, next_uid))
+                    state.agents.params, posx, posy, energy, time_good_level, next_key, policy_states,
+                    time_alive, alive, nb_food, state.agents.nb_offspring, action_int, uid, parent_id, next_uid, grid))
 
             time_under_level = jnp.where(energy < 0, state.agents.time_under_level + 1, 0)
             alive = jnp.where(jnp.logical_or(time_alive > self.max_age, time_under_level > self.time_death), 0, alive)
 
+            grid = grid.at[state.agents.posx, state.agents.posy, 4].set(0)
+            grid = grid.at[posx, posy, 4].set((parent_id * (alive > 0)).astype(jnp.float32))
             done = False
             steps = jnp.where(done, jnp.zeros((), jnp.int32), steps)
 
+            raw_obs = get_obs_vector(grid, posx, posy)
+            is_offspring = (raw_obs[:, :, :, 4] == uid[:, None, None]).astype(jnp.int32)
+            obs = raw_obs.at[:, :, :, 4].set(is_offspring)
 
-            cur_state = State(state=grid, obs=get_obs_vector(grid, posx, posy), last_actions=actions,
+
+            cur_state = State(state=grid, obs=obs, last_actions=actions,
                               rewards=jnp.expand_dims(rewards, -1),
                               agents=AgentStates(posx=posx, posy=posy, orientation=orientation, energy=energy, time_good_level=time_good_level,
                                                  params=params, policy_states=policy_states,
@@ -548,39 +549,12 @@ class Gridworld(VectorizedTask):
              ) -> Tuple[State, jnp.ndarray, jnp.ndarray]:
         return self._step_fn(state)
 
-# TODO 1: Fix uid/parent_id in step_fn
-#   - Read uid, parent_id, next_uid from state at top of step_fn
-#   - Fix next_iud typo -> next_uid in cur_state
-#   - Pass uid, parent_id, next_uid into reproduce()
-#   - In reproduce(): assign uid[empty_spots] = next_uid + arange(5)
-#   - In reproduce(): assign parent_id[empty_spots] = uid[reproducer_spots]
-#   - In reproduce(): increment next_uid by 5 and return it
 
-# TODO 2: No-overlap conflict resolution
-#   - After wall check and clip, assign random priorities per alive agent
-#   - Scatter max priority into grid using tentative posx/posy via .at[].max()
-#   - Agent wins if priority >= priority_grid[posx, posy]
-#   - Revert losers to state.agents.posx/posy
-
-# TODO 3: Parent_id grid channel
-#   - Increment GRID_CHANNELS
-#   - Each step: clear old parent_id channel at state.agents.posx/posy
-#   - Scatter parent_id values into new channel at posx/posy for alive agents
-
-# TODO 4: Observation space
-#   - Include is_infant (already channel 3, currently sliced out in get_ob)
-#   - Add is_offspring channel: compare parent_id channel against each observer's uid
-#   - Update GRID_CHANNELS, OBS_CHANNELS, and get_ob slice accordingly
 
 # TODO 5: Agent architecture ablation
 #   - Add use_lstm: bool flag to MetaRNN_bcppr
 #   - In __call__: bypass LSTM cell when use_lstm=False, pass inputs_encoded directly to hidden layers
 #   - Thread use_lstm through MetaRnnPolicy_bcppr constructor
-
-# TODO 6: Adjacent birth ablation
-#   - In reproduce(): add adjacent_birth: bool flag
-#   - When True: place offspring in a random adjacent cell to the parent
-#   - When False: keep current behaviour (spawn at parent's position)
 
 # TODO 7: Metrics
 #   - Infant survival rate: track fraction of infants (time_alive < threshold) that reach adulthood
