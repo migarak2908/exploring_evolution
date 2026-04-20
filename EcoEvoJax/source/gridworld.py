@@ -54,13 +54,17 @@ class AgentStates(object):
     energy: jnp.ndarray
     time_good_level: jnp.uint16
     time_alive: jnp.uint16
-    time_under_level: jnp.uint16
+    # time_under_level: jnp.uint16
     alive: jnp.int8
     nb_food: jnp.ndarray
     nb_offspring: jnp.uint16
     uid: jnp.uint32
     parent_id: jnp.uint32
-
+    n_fed_total: jnp.uint32
+    n_fed_offspring: jnp.uint32
+    n_faced_offspring: jnp.uint32
+    n_faced_agent: jnp.uint32
+    survived_infancy: jnp.uint32
 
 @dataclass
 class State(TaskState):
@@ -136,16 +140,21 @@ class Gridworld(VectorizedTask):
                  SY=100,
                  reproduction_on=True,
                  proximal_reprod=True,
+                 kin_recognition=True,
                  place_resources=False,
                  place_agent=False,
                  use_lstm=True,
                  params=None,
                  test: bool = False,
-                 energy_decay=0.05,
+                 energy_decay=0.1,
                  max_age: int = 1000,
-                 time_reproduce: int = 150,
-                 time_death: int = 40,
-                 max_ener=3.,
+                 # time_reproduce: int = 150,
+                 # time_death: int = 40,
+                 energy_reproduce: float = 85.,
+                 energy_reproduce_cost: float = 30.,
+                 food_value: float = 20.,
+                 action_cost: float = 1.0,
+                 max_ener=200.,
                  regrowth_scale=0.002,
                  niches_scale=200,
                  spontaneous_regrow=1 / 200000,
@@ -154,7 +163,7 @@ class Gridworld(VectorizedTask):
                  infant_eat_prop=1.0,
                  infant_eat_prob=1.0,
                  infant_threshold=100,
-                 feeding_transfer=0.2
+                 feeding_transfer=20
                  ):
         # self.obs_shape = (AGENT_VIEW, AGENT_VIEW, obs_channels)
         # self.obs_shape=11*5*4
@@ -169,8 +178,12 @@ class Gridworld(VectorizedTask):
 
         self.energy_decay = energy_decay
         self.max_age = max_age
-        self.time_reproduce = time_reproduce
-        self.time_death = time_death
+        # self.time_reproduce = time_reproduce
+        # self.time_death = time_death
+        self.energy_reproduce = energy_reproduce
+        self.energy_reproduce_cost = energy_reproduce_cost
+        self.food_value = food_value
+        self.action_cost = action_cost
         self.max_ener = max_ener
 
         self.regrowth_scale = regrowth_scale
@@ -182,6 +195,7 @@ class Gridworld(VectorizedTask):
         self.params = params
         self.reproduction_on = reproduction_on
         self.proximal_reprod = proximal_reprod
+        self.kin_recognition = kin_recognition
 
         self.infant_move_prob = infant_move_prob
         self.infant_eat_prop = infant_eat_prop
@@ -252,23 +266,31 @@ class Gridworld(VectorizedTask):
             parent_id = jnp.full((nb_agents,), 0)
             next_uid = nb_agents+1
 
+            n_fed_total = jnp.zeros((self.nb_agents,), dtype=jnp.uint32)
+            n_fed_offspring = jnp.zeros((self.nb_agents,), dtype=jnp.uint32)
+            n_faced_offspring = jnp.zeros((self.nb_agents,), dtype=jnp.uint32)
+            n_faced_agent = jnp.zeros((self.nb_agents,), dtype=jnp.uint32)
+            survived_infancy = jnp.zeros((self.nb_agents,), dtype=jnp.uint32)
+
             agents = AgentStates(posx=posx, posy=posy, orientation=orientation,
                                  energy=self.max_ener * jnp.ones((self.nb_agents,)),
                                  time_good_level=jnp.zeros((self.nb_agents,), dtype=jnp.uint16), params=params,
                                  policy_states=policy_states,
                                  time_alive=jnp.zeros((self.nb_agents,), dtype=jnp.uint16),
-                                 time_under_level=jnp.zeros((self.nb_agents,), dtype=jnp.uint16),
                                  alive=jnp.ones((self.nb_agents,), dtype=jnp.uint16).at[0:2 * self.nb_agents // 3].set(
                                      0),
                                  nb_food=jnp.zeros((self.nb_agents,)),
                                  nb_offspring=jnp.zeros((self.nb_agents,), dtype=jnp.uint16),
                                  uid=uid,
-                                 parent_id=parent_id
+                                 parent_id=parent_id, n_fed_total=n_fed_total, n_fed_offspring=n_fed_offspring,
+                                 n_faced_offspring=n_faced_offspring, n_faced_agent=n_faced_agent, survived_infancy=survived_infancy
                                  )
 
             raw_obs = get_obs_vector(grid, posx, posy)
-            is_offspring = (raw_obs[:, :, :, 4] == uid[:, None, None]).astype(jnp.int32)
+            is_offspring = (raw_obs[:, :, :, 4].astype(jnp.int32) == uid[:, None, None]).astype(jnp.int32)
             obs = raw_obs.at[:, :, :, 4].set(is_offspring)
+            if not self.kin_recognition:
+                obs = raw_obs.at[:, :, :, 4].set(0)
 
             return State(state=grid, obs=obs, last_actions=jnp.zeros((self.nb_agents, NUM_ACTIONS)),
                          rewards=jnp.zeros((self.nb_agents, 1)), agents=agents,
@@ -278,9 +300,11 @@ class Gridworld(VectorizedTask):
 
 
         def reproduce(params, posx, posy, energy, time_good_level, key, policy_states, time_alive, alive, nb_food,
-                      nb_offspring, action_int, uid, parent_id, next_uid, grid):
+                      nb_offspring, action_int, uid, parent_id, next_uid, grid, n_fed_total, n_fed_offspring, n_faced_offspring,
+                      n_faced_agent, survived_infancy):
 
-            reproducer_mask = (time_good_level > self.time_reproduce) * action_int[:, 6] * (alive > 0)
+            reproducer_mask = (energy >= self.energy_reproduce) * action_int[:, 6] * (alive > 0)
+            reproducer_mask = reproducer_mask * (alive.sum() < self.nb_agents).astype(jnp.int32)
             dead_mask = (1 - alive)
 
             reprod_rank = jnp.cumsum(reproducer_mask) * reproducer_mask
@@ -342,6 +366,7 @@ class Gridworld(VectorizedTask):
             nb_food = jnp.where(is_filled, 0, nb_food)
             nb_offspring = jnp.where(is_filled, 0, nb_offspring)
 
+
             policy_states = metaRNNPolicyState_bcppr(
                 lstm_h=jnp.where(is_filled[:, None], jnp.zeros_like(policy_states.lstm_h), policy_states.lstm_h),
                 lstm_c=jnp.where(is_filled[:, None], jnp.zeros_like(policy_states.lstm_c), policy_states.lstm_c),
@@ -352,9 +377,17 @@ class Gridworld(VectorizedTask):
             nb_offspring = nb_offspring + actually_reproduced.astype(jnp.int32)
 
             time_good_level = jnp.where(actually_reproduced, 0, time_good_level)
+            energy = jnp.where(actually_reproduced, energy - self.energy_reproduce_cost, energy)
+
+            n_fed_total = jnp.where(is_filled, 0, n_fed_total)
+            n_fed_offspring = jnp.where(is_filled, 0, n_fed_offspring)
+            n_faced_offspring = jnp.where(is_filled, 0, n_faced_offspring)
+            n_faced_agent = jnp.where(is_filled, 0, n_faced_agent)
+            survived_infancy = jnp.where(is_filled, 0, survived_infancy)
 
             return (params, posx, posy, energy, time_good_level, policy_states, time_alive,
-                    alive, nb_food, nb_offspring, uid, parent_id, next_uid)
+                    alive, nb_food, nb_offspring, uid, parent_id, next_uid, n_fed_total, n_fed_offspring, n_faced_offspring,
+                      n_faced_agent, survived_infancy)
 
 
         def step_fn(state):
@@ -373,6 +406,7 @@ class Gridworld(VectorizedTask):
 
             # obtain actions
             action_int = actions.astype(jnp.int32)
+            action_cost = jnp.where(action_int[:, 0] != 1, self.action_cost, 0)
 
             # identify infants
             is_infant = state.agents.time_alive < self.infant_threshold
@@ -442,7 +476,9 @@ class Gridworld(VectorizedTask):
 
             # collect food
 
-            rewards = (alive > 0) * (grid[posx, posy, 1] > 0) * (1 / (grid[posx, posy, 0] + 1e-10))
+            # rewards = (alive > 0) * (grid[posx, posy, 1] > 0) * (1 / (grid[posx, posy, 0] + 1e-10))
+            rewards = (alive > 0) * (grid[posx, posy, 1] > 0)
+
             rewards = rewards * action_int[:, 4]
 
             next_key, key = jax.random.split(key)
@@ -487,7 +523,7 @@ class Gridworld(VectorizedTask):
             steps = state.steps + 1
 
             # decay of energy and clipping
-            energy = energy - self.energy_decay + rewards
+            energy = energy - self.energy_decay - action_cost + rewards * self.food_value
             energy = jnp.clip(energy, -1000, self.max_ener)
 
             time_good_level = jnp.where(energy > 0, (state.agents.time_good_level + 1) * alive, 0)
@@ -497,6 +533,8 @@ class Gridworld(VectorizedTask):
             # look if still alive
 
             time_alive = jnp.where(alive > 0, time_alive + 1, 0)
+            survived_infancy = jnp.where((time_alive == self.infant_threshold) & (alive > 0), 1,
+                                         state.agents.survived_infancy)
 
             # Update infants
             grid = grid.at[state.agents.posx, state.agents.posy, 3].set(0)
@@ -504,19 +542,30 @@ class Gridworld(VectorizedTask):
             grid = grid.at[:, :, 3].set(jnp.clip(grid[:, :, 3], 0, 1))
 
             # compute reproducer and go through the function only if there is one
-            reproducer = jnp.where(time_good_level > self.time_reproduce, 1, 0) * action_int[:, 6]
+            reproducer = jnp.where(energy >= self.energy_reproduce, 1, 0) * action_int[:, 6]
             uid, parent_id, next_uid = state.agents.uid, state.agents.parent_id, state.next_uid
             next_key, key = random.split(key)
 
+            is_offspring_matrix = (parent_id[None, :] == uid[:, None])
+            n_fed_total = state.agents.n_fed_total + valid_feed.any(axis=1).astype(jnp.uint32)
+            n_fed_offspring = state.agents.n_fed_offspring + (valid_feed & is_offspring_matrix).any(axis=1).astype(
+                jnp.uint32)
+            facing = success_feed & can_receive
+            n_faced_agent = state.agents.n_faced_agent + facing.any(axis=1).astype(jnp.uint32)
+            n_faced_offspring = state.agents.n_faced_offspring + (facing & is_offspring_matrix).any(axis=1).astype(
+                jnp.uint32)
 
-            params, posx, posy, energy, time_good_level, policy_states, time_alive, alive, nb_food, nb_offspring, uid, parent_id, next_uid = jax.lax.cond(
-                reproducer.sum() > 0, reproduce, lambda y, z, a, b, c, d, e, f, g, h, i, j, k, l, m, n: (y, z, a, b, c, e, f, g, h, i, k, l, m),
+            params, posx, posy, energy, time_good_level, policy_states, time_alive, alive, nb_food, nb_offspring, uid, parent_id, next_uid, \
+            n_fed_total, n_fed_offspring, n_faced_offspring, n_faced_agent, survived_infancy = jax.lax.cond(
+                reproducer.sum() > 0, reproduce, lambda y, z, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s:
+                (y, z, a, b, c, e, f, g, h, i, k, l, m, o, p, q, r, s),
                 *(
                     state.agents.params, posx, posy, energy, time_good_level, next_key, policy_states,
-                    time_alive, alive, nb_food, state.agents.nb_offspring, action_int, uid, parent_id, next_uid, grid))
+                    time_alive, alive, nb_food, state.agents.nb_offspring, action_int, uid, parent_id, next_uid, grid, n_fed_total, n_fed_offspring, n_faced_offspring,
+                      n_faced_agent, survived_infancy))
 
-            time_under_level = jnp.where(energy < 0, state.agents.time_under_level + 1, 0)
-            alive = jnp.where(jnp.logical_or(time_alive > self.max_age, time_under_level > self.time_death), 0, alive)
+            # time_under_level = jnp.where(energy < 0, state.agents.time_under_level + 1, 0)
+            alive = jnp.where(jnp.logical_or(time_alive > self.max_age, energy < 0), 0, alive)
 
             grid = grid.at[state.agents.posx, state.agents.posy, 4].set(0)
             grid = grid.at[posx, posy, 4].set((parent_id * (alive > 0)).astype(jnp.float32))
@@ -524,16 +573,18 @@ class Gridworld(VectorizedTask):
             steps = jnp.where(done, jnp.zeros((), jnp.int32), steps)
 
             raw_obs = get_obs_vector(grid, posx, posy)
-            is_offspring = (raw_obs[:, :, :, 4] == uid[:, None, None]).astype(jnp.int32)
+            is_offspring = (raw_obs[:, :, :, 4].astype(jnp.int32) == uid[:, None, None]).astype(jnp.int32)
             obs = raw_obs.at[:, :, :, 4].set(is_offspring)
-
+            if not self.kin_recognition:
+                obs = obs.at[:, :, :, 4].set(0)
 
             cur_state = State(state=grid, obs=obs, last_actions=actions,
                               rewards=jnp.expand_dims(rewards, -1),
                               agents=AgentStates(posx=posx, posy=posy, orientation=orientation, energy=energy, time_good_level=time_good_level,
                                                  params=params, policy_states=policy_states,
-                                                 time_alive=time_alive, time_under_level=time_under_level, alive=alive,
-                                                 nb_food=nb_food, nb_offspring=nb_offspring, uid=uid, parent_id=parent_id),
+                                                 time_alive=time_alive, alive=alive,
+                                                 nb_food=nb_food, nb_offspring=nb_offspring, uid=uid, parent_id=parent_id,  n_fed_total=n_fed_total, n_fed_offspring=n_fed_offspring,
+                         n_faced_offspring=n_faced_offspring, n_faced_agent=n_faced_agent, survived_infancy=survived_infancy),
                               steps=steps, key=key, next_uid=next_uid)
             # keep it in case we let agent several trials
             state = jax.lax.cond(
@@ -551,10 +602,5 @@ class Gridworld(VectorizedTask):
              ) -> Tuple[State, jnp.ndarray, jnp.ndarray]:
         return self._step_fn(state)
 
-
-# TODO 7: Metrics
-#   - Infant survival rate: track fraction of infants (time_alive < threshold) that reach adulthood
-#   - Feeding amount: total energy transferred via feed action per step
-#   - Feeding selectivity: implement equation 2 from Taylor-Davies et al.
 
 
