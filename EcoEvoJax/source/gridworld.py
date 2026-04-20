@@ -261,10 +261,10 @@ class Gridworld(VectorizedTask):
 
             next_key, key = random.split(key)
 
-            orientation = random.randint(next_key, (nb_agents,), 0, 4)
+            orientation = random.randint(next_key, (nb_agents,), minval=0, maxval=4)
             uid = jnp.arange(1, nb_agents+1)
             parent_id = jnp.full((nb_agents,), 0)
-            next_uid = nb_agents+1
+            next_uid = jnp.uint32(nb_agents+1)
 
             n_fed_total = jnp.zeros((self.nb_agents,), dtype=jnp.uint32)
             n_fed_offspring = jnp.zeros((self.nb_agents,), dtype=jnp.uint32)
@@ -328,9 +328,9 @@ class Gridworld(VectorizedTask):
 
             else:
                 next_key, key = jax.random.split(key)
-                spawn_x = random.randint(next_key, (nb_agents,), 1, SX - 2)
+                spawn_x = random.randint(next_key, (nb_agents,), 1, SX-2)
                 next_key, key = jax.random.split(key)
-                spawn_y = random.randint(next_key, (nb_agents,), 1, SY - 2)
+                spawn_y = random.randint(next_key, (nb_agents,), 1, SY-2)
 
             offspring_x = spawn_x[parent_idx]
             offspring_y = spawn_y[parent_idx]
@@ -384,6 +384,8 @@ class Gridworld(VectorizedTask):
             n_faced_offspring = jnp.where(is_filled, 0, n_faced_offspring)
             n_faced_agent = jnp.where(is_filled, 0, n_faced_agent)
             survived_infancy = jnp.where(is_filled, 0, survived_infancy)
+
+            nb_offspring = nb_offspring.astype(jnp.uint16)
 
             return (params, posx, posy, energy, time_good_level, policy_states, time_alive,
                     alive, nb_food, nb_offspring, uid, parent_id, next_uid, n_fed_total, n_fed_offspring, n_faced_offspring,
@@ -457,7 +459,7 @@ class Gridworld(VectorizedTask):
 
             #precedence and takes the position.
             next_key, key = jax.random.split(key)
-            priority = jax.random.uniform(next_key, (nb_agents, ), 0.0, 1.0)
+            priority = jax.random.uniform(next_key, (nb_agents, ), minval=0.0, maxval=1.0)
 
             candidate_posx = (posx[:, None] == posx[None, :])
             candidate_posy = (posy[:, None] == posy[None, :])
@@ -543,7 +545,7 @@ class Gridworld(VectorizedTask):
 
             # compute reproducer and go through the function only if there is one
             reproducer = jnp.where(energy >= self.energy_reproduce, 1, 0) * action_int[:, 6]
-            uid, parent_id, next_uid = state.agents.uid, state.agents.parent_id, state.next_uid
+            uid, parent_id, next_uid = state.agents.uid, state.agents.parent_id, state.next_uid.astype(jnp.uint32)
             next_key, key = random.split(key)
 
             is_offspring_matrix = (parent_id[None, :] == uid[:, None])

@@ -1,3 +1,6 @@
+import sys
+sys.path.insert(0, 'EcoEvoJax')
+
 import os
 import pickle
 import numpy as np
