@@ -24,11 +24,12 @@ class MetaRNN_bcppr(nn.Module):
     encoder_in: bool
     encoder_layers: list
     use_lstm: bool
+    hidden_size: int
 
     def setup(self):
 
         self._num_micro_ticks = 1
-        self._lstm = nn.recurrent.LSTMCell()
+        self._lstm = nn.recurrent.LSTMCell(features=self.hidden_size)
         self.convs = [nn.Conv(features=4, kernel_size=(3, 3),strides=2),nn.Conv(features=8, kernel_size=(3, 3),strides=2)]
 
         self._hiddens = [(nn.Dense(size)) for size in self.hidden_layers]
@@ -103,7 +104,7 @@ class MetaRnnPolicy_bcppr(PolicyNetwork):
         else:
             self._logger = logger
         model = MetaRNN_bcppr(output_dim, out_fn=output_act_fn, hidden_layers=hidden_layers, encoder_in=encoder,
-                              encoder_layers=encoder_layers, use_lstm=use_lstm)
+                              encoder_layers=encoder_layers, use_lstm=use_lstm, hidden_size=hidden_dim)
         self.params = model.init(jax.random.PRNGKey(0), jnp.zeros((hidden_dim)), jnp.zeros((hidden_dim)),
                                  jnp.zeros(input_dim), jnp.zeros([output_dim]), jnp.zeros([1]))
 

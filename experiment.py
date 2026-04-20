@@ -1,11 +1,13 @@
 import os
 import pickle
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import random
 import wandb
 
 from EcoEvoJax.source.gridworld import Gridworld
+from EcoEvoJax.source.utils import VideoWriter
 
 # ── Ablation config — toggle these ──────────────────────
 config = dict(
@@ -30,6 +32,8 @@ config = dict(
     # training
     n_steps          = 500_000,
     log_every        = 500,
+    video_every      = 50_000,
+    video_length     = 200,
     checkpoint_every = 50_000,
     checkpoint_dir   = 'checkpoints',
     seed             = 0,
@@ -75,6 +79,24 @@ def compute_metrics(state):
     }
 
 
+def render_frame(state):
+    grid = np.array(state.state)
+    rgb = np.ones((grid.shape[0], grid.shape[1], 3), dtype=np.float32)
+    food    = np.clip(grid[:, :, 1], 0, 1)
+    rgb[:, :, 0] -= food
+    rgb[:, :, 2] -= food
+    agents  = np.clip(grid[:, :, 0], 0, 1)
+    rgb[:, :, 0] -= agents
+    rgb[:, :, 1] -= agents
+    rgb[:, :, 2] -= agents
+    infants = np.clip(grid[:, :, 3], 0, 1)
+    rgb[:, :, 2] -= infants * 0.6
+    rgb = np.clip(rgb, 0, 1)
+    rgb = np.repeat(rgb, 2, axis=0)
+    rgb = np.repeat(rgb, 2, axis=1)
+    return rgb
+
+
 def save_checkpoint(state, step, cfg):
     os.makedirs(cfg['checkpoint_dir'], exist_ok=True)
     path = os.path.join(cfg['checkpoint_dir'], f"{run_name(cfg)}_step{step}.pkl")
@@ -110,9 +132,28 @@ def main(cfg):
 
     print(f"Run: {name}  |  params/agent: {env.model.num_params}")
 
+    vid = None
+    vid_path = None
+    vid_step = 0
+
     for step in range(1, cfg['n_steps'] + 1):
         state, rewards, energy = env.step(state)
 
+        # ── video capture ──────────────────────────────────
+        if step % cfg['video_every'] == 1:
+            vid_step = step
+            vid_path = os.path.join(cfg['checkpoint_dir'], f"{name}_step{step}.mp4")
+            os.makedirs(cfg['checkpoint_dir'], exist_ok=True)
+            vid = VideoWriter(vid_path, fps=20.0)
+
+        if vid is not None:
+            vid.add(render_frame(state))
+            if (step - vid_step + 1) >= cfg['video_length']:
+                vid.close()
+                wandb.log({'video': wandb.Video(vid_path, fps=20, format='mp4')}, step=step)
+                vid = None
+
+        # ── metrics ───────────────────────────────────────
         if step % cfg['log_every'] == 0:
             metrics = compute_metrics(state)
             wandb.log(metrics, step=step)
@@ -124,8 +165,13 @@ def main(cfg):
                 f"infant_surv={metrics['infant_survival_rate']:.3f}"
             )
 
+        # ── checkpoint ────────────────────────────────────
         if step % cfg['checkpoint_every'] == 0:
             save_checkpoint(state, step, cfg)
+
+    if vid is not None:
+        vid.close()
+        wandb.log({'video': wandb.Video(vid_path, fps=20, format='mp4')}, step=cfg['n_steps'])
 
     save_checkpoint(state, cfg['n_steps'], cfg)
     wandb.finish()
