@@ -76,6 +76,8 @@ class State(TaskState):
     steps: jnp.int32
     key: jnp.ndarray
     next_uid: jnp.uint32
+    total_born: jnp.uint32
+    total_survived_infancy: jnp.uint32
 
 
 def get_ob(state: jnp.ndarray, pos_x: jnp.int32, pos_y: jnp.int32) -> jnp.ndarray:
@@ -158,6 +160,7 @@ class Gridworld(VectorizedTask):
                  regrowth_scale=0.002,
                  niches_scale=200,
                  spontaneous_regrow=1 / 200000,
+                 simple_regrowth=True,
                  wall_kill=True,
                  infant_move_prob=1.0,
                  infant_eat_prop=1.0,
@@ -189,6 +192,7 @@ class Gridworld(VectorizedTask):
         self.regrowth_scale = regrowth_scale
         self.niches_scale = niches_scale
         self.spontaneous_regrow = spontaneous_regrow
+        self.simple_regrowth = simple_regrowth
         self.place_agent = place_agent
         self.place_resources = place_resources
         self.use_lstm = use_lstm
@@ -262,9 +266,11 @@ class Gridworld(VectorizedTask):
             next_key, key = random.split(key)
 
             orientation = random.randint(next_key, (nb_agents,), minval=0, maxval=4)
-            uid = jnp.arange(1, nb_agents+1)
-            parent_id = jnp.full((nb_agents,), 0)
+            uid = jnp.arange(1, nb_agents+1, dtype=jnp.uint32)
+            parent_id = jnp.full((nb_agents,), 0, dtype=jnp.uint32)
             next_uid = jnp.uint32(nb_agents+1)
+            total_born = jnp.uint32(nb_agents - 2 * nb_agents // 3)
+            total_survived_infancy = jnp.uint32(0)
 
             n_fed_total = jnp.zeros((self.nb_agents,), dtype=jnp.uint32)
             n_fed_offspring = jnp.zeros((self.nb_agents,), dtype=jnp.uint32)
@@ -287,14 +293,15 @@ class Gridworld(VectorizedTask):
                                  )
 
             raw_obs = get_obs_vector(grid, posx, posy)
-            is_offspring = (raw_obs[:, :, :, 4].astype(jnp.int32) == uid[:, None, None]).astype(jnp.int32)
+            is_offspring = (raw_obs[:, :, :, 4].astype(jnp.uint32) == uid[:, None, None]).astype(jnp.int32)
             obs = raw_obs.at[:, :, :, 4].set(is_offspring)
             if not self.kin_recognition:
-                obs = raw_obs.at[:, :, :, 4].set(0)
+                obs = obs.at[:, :, :, 4].set(0)
 
             return State(state=grid, obs=obs, last_actions=jnp.zeros((self.nb_agents, NUM_ACTIONS)),
                          rewards=jnp.zeros((self.nb_agents, 1)), agents=agents,
-                         steps=jnp.zeros((), dtype=int), key=next_key, next_uid=next_uid)
+                         steps=jnp.zeros((), dtype=int), key=next_key, next_uid=next_uid,
+                         total_born=total_born, total_survived_infancy=total_survived_infancy)
 
         self._reset_fn = jax.jit(reset_fn)
 
@@ -504,22 +511,27 @@ class Gridworld(VectorizedTask):
             scale_constant = regrowth_scale
             next_key, key = random.split(key)
 
-            if scale_constant:
+            if self.simple_regrowth:
+                regrow_prob = jnp.where(num_neighbs > 0, 0.003, 0.)
+                grid = grid.at[:, :, 1].add(random.bernoulli(next_key, regrow_prob))
 
-                num_neighbs = jnp.where(num_neighbs == 0, 0, num_neighbs)
-                num_neighbs = jnp.where(num_neighbs == 1, 0.01 / 5, num_neighbs)
-                num_neighbs = jnp.where(num_neighbs == 2, 0.01 / scale_constant, num_neighbs)
-                num_neighbs = jnp.where(num_neighbs == 3, 0.05 / scale_constant, num_neighbs)
-                num_neighbs = jnp.where(num_neighbs > 3, 0, num_neighbs)
-                num_neighbs = jnp.multiply(num_neighbs, scale)
-                num_neighbs = jnp.where(num_neighbs > 0, num_neighbs, 0)
-                # num_neighbs = num_neighbs + self.spontaneous_regrow * scale
-                num_neighbs = num_neighbs + self.spontaneous_regrow
-                # num_neighbs=num_neighbs.at[350:356,98:102].set(1/40)
+            else:
+                if scale_constant:
 
-                num_neighbs = jnp.clip(num_neighbs - grid[:, :, 2], 0, 1)
+                    num_neighbs = jnp.where(num_neighbs == 0, 0, num_neighbs)
+                    num_neighbs = jnp.where(num_neighbs == 1, 0.01 / 5, num_neighbs)
+                    num_neighbs = jnp.where(num_neighbs == 2, 0.01 / scale_constant, num_neighbs)
+                    num_neighbs = jnp.where(num_neighbs == 3, 0.05 / scale_constant, num_neighbs)
+                    num_neighbs = jnp.where(num_neighbs > 3, 0, num_neighbs)
+                    num_neighbs = jnp.multiply(num_neighbs, scale)
+                    num_neighbs = jnp.where(num_neighbs > 0, num_neighbs, 0)
+                    # num_neighbs = num_neighbs + self.spontaneous_regrow * scale
+                    num_neighbs = num_neighbs + self.spontaneous_regrow
+                    # num_neighbs=num_neighbs.at[350:356,98:102].set(1/40)
 
-                grid = grid.at[:, :, 1].add(random.bernoulli(next_key, num_neighbs))
+                    num_neighbs = jnp.clip(num_neighbs - grid[:, :, 2], 0, 1)
+
+                    grid = grid.at[:, :, 1].add(random.bernoulli(next_key, num_neighbs))
 
             ####
             steps = state.steps + 1
@@ -557,6 +569,8 @@ class Gridworld(VectorizedTask):
             n_faced_offspring = state.agents.n_faced_offspring + (facing & is_offspring_matrix).any(axis=1).astype(
                 jnp.uint32)
 
+            alive_before_repro = (alive > 0).sum().astype(jnp.uint32)
+
             params, posx, posy, energy, time_good_level, policy_states, time_alive, alive, nb_food, nb_offspring, uid, parent_id, next_uid, \
             n_fed_total, n_fed_offspring, n_faced_offspring, n_faced_agent, survived_infancy = jax.lax.cond(
                 reproducer.sum() > 0, reproduce, lambda y, z, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s:
@@ -565,6 +579,11 @@ class Gridworld(VectorizedTask):
                     state.agents.params, posx, posy, energy, time_good_level, next_key, policy_states,
                     time_alive, alive, nb_food, state.agents.nb_offspring, action_int, uid, parent_id, next_uid, grid, n_fed_total, n_fed_offspring, n_faced_offspring,
                       n_faced_agent, survived_infancy))
+
+            n_births = (alive > 0).sum().astype(jnp.uint32) - alive_before_repro
+            total_born = state.total_born + n_births
+            newly_survived = ((time_alive == self.infant_threshold) & (alive > 0)).sum().astype(jnp.uint32)
+            total_survived_infancy = state.total_survived_infancy + newly_survived
 
             # time_under_level = jnp.where(energy < 0, state.agents.time_under_level + 1, 0)
             alive = jnp.where(jnp.logical_or(time_alive > self.max_age, energy < 0), 0, alive)
@@ -575,7 +594,7 @@ class Gridworld(VectorizedTask):
             steps = jnp.where(done, jnp.zeros((), jnp.int32), steps)
 
             raw_obs = get_obs_vector(grid, posx, posy)
-            is_offspring = (raw_obs[:, :, :, 4].astype(jnp.int32) == uid[:, None, None]).astype(jnp.int32)
+            is_offspring = (raw_obs[:, :, :, 4].astype(jnp.uint32) == uid[:, None, None]).astype(jnp.int32)
             obs = raw_obs.at[:, :, :, 4].set(is_offspring)
             if not self.kin_recognition:
                 obs = obs.at[:, :, :, 4].set(0)
@@ -587,7 +606,8 @@ class Gridworld(VectorizedTask):
                                                  time_alive=time_alive, alive=alive,
                                                  nb_food=nb_food, nb_offspring=nb_offspring, uid=uid, parent_id=parent_id,  n_fed_total=n_fed_total, n_fed_offspring=n_fed_offspring,
                          n_faced_offspring=n_faced_offspring, n_faced_agent=n_faced_agent, survived_infancy=survived_infancy),
-                              steps=steps, key=key, next_uid=next_uid)
+                              steps=steps, key=key, next_uid=next_uid,
+                              total_born=total_born, total_survived_infancy=total_survived_infancy)
             # keep it in case we let agent several trials
             state = jax.lax.cond(
                 done, lambda x: reset_fn(state.key), lambda x: x, cur_state)

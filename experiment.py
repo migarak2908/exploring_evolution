@@ -32,6 +32,11 @@ config = dict(
     energy_reproduce = 85.,
     energy_reproduce_cost = 30.,
     infant_threshold = 100,
+    simple_regrowth  = True,
+    # infant parameters
+    infant_eat_prop  = 1.0,
+    infant_eat_prob  = 1.0,
+    infant_move_prob = 1.0,
     # training
     n_steps          = 500_000,
     log_every        = 500,
@@ -66,19 +71,18 @@ def compute_metrics(state):
         state.agents.n_fed_offspring / (state.agents.n_fed_total + eps)
         - state.agents.n_faced_offspring / (state.agents.n_faced_agent + eps)
     )
-    mean_selectivity = (selectivity * alive).sum() / (n_alive + eps)
+    fed_mask = (state.agents.n_fed_total > 0).astype(jnp.float32) * alive
+    n_feeders = fed_mask.sum()
+    mean_selectivity = (selectivity * fed_mask).sum() / (n_feeders + eps)
 
     mean_feeding = (state.agents.n_fed_total.astype(jnp.float32) * alive).sum() / (n_alive + eps)
-    infant_survival = state.agents.survived_infancy.sum() / state.agents.survived_infancy.shape[0]
-    mean_nb_offspring = (state.agents.nb_offspring.astype(jnp.float32) * alive).sum() / (n_alive + eps)
-
+    infant_survival = float(state.total_survived_infancy) / (float(state.total_born) + 1e-10)
     return {
         'population':          int(n_alive),
         'mean_energy':         float(mean_energy),
         'mean_selectivity':    float(mean_selectivity),
         'mean_feeding_events': float(mean_feeding),
         'infant_survival_rate':float(infant_survival),
-        'mean_nb_offspring':   float(mean_nb_offspring),
     }
 
 
@@ -128,6 +132,10 @@ def main(cfg):
         energy_reproduce = cfg['energy_reproduce'],
         energy_reproduce_cost = cfg['energy_reproduce_cost'],
         infant_threshold = cfg['infant_threshold'],
+        simple_regrowth  = cfg['simple_regrowth'],
+        infant_eat_prop  = cfg['infant_eat_prop'],
+        infant_eat_prob  = cfg['infant_eat_prob'],
+        infant_move_prob = cfg['infant_move_prob'],
     )
 
     key = random.PRNGKey(cfg['seed'])
@@ -138,6 +146,7 @@ def main(cfg):
     vid = None
     vid_path = None
     vid_step = 0
+    metrics_history = []
 
     for step in range(1, cfg['n_steps'] + 1):
         state, rewards, energy = env.step(state)
@@ -159,6 +168,8 @@ def main(cfg):
         # ── metrics ───────────────────────────────────────
         if step % cfg['log_every'] == 0:
             metrics = compute_metrics(state)
+            metrics['step'] = step
+            metrics_history.append(metrics)
             wandb.log(metrics, step=step)
             print(
                 f"step {step:>7} | "
@@ -177,6 +188,12 @@ def main(cfg):
         wandb.log({'video': wandb.Video(vid_path, fps=20, format='mp4')}, step=cfg['n_steps'])
 
     save_checkpoint(state, cfg['n_steps'], cfg)
+
+    # save metrics history for offline analysis
+    metrics_path = os.path.join(cfg['checkpoint_dir'], f"{name}_metrics.pkl")
+    with open(metrics_path, 'wb') as f:
+        pickle.dump({'config': cfg, 'metrics': metrics_history}, f)
+
     wandb.finish()
 
 
