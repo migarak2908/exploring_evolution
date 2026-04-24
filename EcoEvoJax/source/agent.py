@@ -30,7 +30,11 @@ class MetaRNN_bcppr(nn.Module):
 
         self._num_micro_ticks = 1
         self._lstm = nn.recurrent.LSTMCell(features=self.hidden_size)
-        self.convs = [nn.Conv(features=4, kernel_size=(3, 3),strides=2),nn.Conv(features=8, kernel_size=(3, 3),strides=2)]
+        self.convs = [
+            nn.Conv(features=32, kernel_size=(5, 5), strides=1),
+            nn.Conv(features=16, kernel_size=(5, 5), strides=1),
+            nn.Conv(features=8,  kernel_size=(5, 5), strides=1),
+        ]
 
         self._hiddens = [(nn.Dense(size)) for size in self.hidden_layers]
         # self._encoder=nn.Dense(64)
@@ -46,7 +50,6 @@ class MetaRNN_bcppr(nn.Module):
         for conv in self.convs:
             out = conv(out)
             out = nn.relu(out)
-            out = nn.avg_pool(out, window_shape=(2, 2), strides=(1, 1))
 
         out = jnp.ravel(out)
 

@@ -160,17 +160,19 @@ class Gridworld(VectorizedTask):
                  params=None,
                  test: bool = False,
                  energy_decay=0.1,
-                 max_age: int = 1000,
+                 max_age: int = 500,
                  # time_reproduce: int = 150,
                  # time_death: int = 40,
-                 energy_reproduce: float = 85.,
-                 energy_reproduce_cost: float = 30.,
+                 energy_reproduce: float = 80.,
+                 energy_reproduce_cost: float = 20.,
+                 energy_initial: float = 65.,
                  food_value: float = 20.,
                  action_cost: float = 1.0,
                  max_ener=200.,
                  regrowth_scale=0.002,
                  niches_scale=1.1,
                  spontaneous_regrow=1 / 200000,
+                 regrowth_prob=0.003,
                  simple_regrowth=True,
                  wall_kill=True,
                  infant_move_prob=1.0,
@@ -187,8 +189,8 @@ class Gridworld(VectorizedTask):
         self.SX = SX
         self.SY = SY
         self.energy_decay = energy_decay
-        self.model = MetaRnnPolicy_bcppr(input_dim=((AGENT_VIEW * 2 + 1), (AGENT_VIEW * 2 + 1), obs_channels), hidden_dim=4,
-                                         output_dim=action_space, encoder_layers=[], hidden_layers=[8], use_lstm=use_lstm)
+        self.model = MetaRnnPolicy_bcppr(input_dim=((AGENT_VIEW * 2 + 1), (AGENT_VIEW * 2 + 1), obs_channels), hidden_dim=8,
+                                         output_dim=action_space, encoder_layers=[], hidden_layers=[], use_lstm=use_lstm)
 
         self.energy_decay = energy_decay
         self.max_age = max_age
@@ -196,6 +198,7 @@ class Gridworld(VectorizedTask):
         # self.time_death = time_death
         self.energy_reproduce = energy_reproduce
         self.energy_reproduce_cost = energy_reproduce_cost
+        self.energy_initial = energy_initial
         self.food_value = food_value
         self.action_cost = action_cost
         self.max_ener = max_ener
@@ -203,6 +206,7 @@ class Gridworld(VectorizedTask):
         self.regrowth_scale = regrowth_scale
         self.niches_scale = niches_scale
         self.spontaneous_regrow = spontaneous_regrow
+        self.regrowth_prob = regrowth_prob
         self.simple_regrowth = simple_regrowth
         self.place_agent = place_agent
         self.place_resources = place_resources
@@ -380,7 +384,7 @@ class Gridworld(VectorizedTask):
 
             posx = jnp.where(is_filled, offspring_x, posx)
             posy = jnp.where(is_filled, offspring_y, posy)
-            energy = jnp.where(is_filled, self.energy_reproduce, energy)
+            energy = jnp.where(is_filled, self.energy_initial, energy)
             time_good_level = jnp.where(is_filled, 0, time_good_level)
             alive = jnp.where(is_filled, 1, alive)
             time_alive = jnp.where(is_filled, 0, time_alive)
@@ -526,7 +530,7 @@ class Gridworld(VectorizedTask):
             next_key, key = random.split(key)
 
             if self.simple_regrowth:
-                regrow_prob = jnp.where(num_neighbs > 0, 0.00003, self.spontaneous_regrow)
+                regrow_prob = jnp.where(grid[:, :, 2] > 0, 0., self.regrowth_prob)
                 grid = grid.at[:, :, 1].add(random.bernoulli(next_key, regrow_prob))
                 grid = grid.at[:, :, 1].set(jnp.clip(grid[:, :, 1], 0, 1))
 
