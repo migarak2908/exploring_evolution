@@ -1,3 +1,25 @@
+"""
+Full experiment sweep to replicate and extend Taylor-Davies et al. (2024).
+
+Structure
+---------
+1. Paper replication sweep:
+   - Vary each infant parameter independently (eat_prop, eat_prob, move_prob)
+   - Each condition run with feeding enabled AND disabled (to compute b̂)
+   - CNN-only (no LSTM), kin recognition on, proximal birth (paper defaults)
+
+2. Ablation conditions (at default infant params):
+   - No kin recognition
+   - Random birth location
+
+3. Extension (optional, uncomment):
+   - Same sweep but with LSTM
+
+Toggle what runs by editing SWEEP_PARAMS, ABLATIONS, and SEEDS below.
+"""
+import sys
+sys.path.insert(0, 'EcoEvoJax')
+
 import os
 import pickle
 import numpy as np
@@ -9,14 +31,36 @@ import wandb
 from EcoEvoJax.source.gridworld import Gridworld
 from EcoEvoJax.source.utils import VideoWriter
 
-# ── Base config ─────────────────────────────────────────
-base_config = dict(
-    # environment
+# ── Sweep configuration ─────────────────────────────────
+
+SEEDS = [0, 1, 2]   # seeds per condition; reduce to [0] for quick runs
+
+INFANT_PARAM_VALUES = [0.1, 0.25, 0.5, 0.75, 1.0]
+
+# Each entry: (swept_param, fixed_overrides)
+SWEEP_PARAMS = [
+    ('infant_eat_prop',  {}),
+    ('infant_eat_prob',  {}),
+    ('infant_move_prob', {}),
+]
+
+# Ablation conditions run at default infant params (all 1.0)
+ABLATIONS = [
+    dict(use_lstm=False, kin_recognition=False, proximal_reprod=True,  label='no-kin'),
+    dict(use_lstm=False, kin_recognition=True,  proximal_reprod=False, label='rand-birth'),
+    # Uncomment for LSTM extension:
+    # dict(use_lstm=True, kin_recognition=True, proximal_reprod=True, label='lstm'),
+]
+
+# ── Base config (paper defaults) ────────────────────────
+BASE_CONFIG = dict(
+    use_lstm             = False,   # paper uses CNN-only
+    kin_recognition      = True,
+    proximal_reprod      = True,
     nb_agents            = 2500,
     SX                   = 100,
     SY                   = 100,
     init_food            = 1000,
-    # energy / reproduction (paper defaults)
     energy_decay         = 0.1,
     max_ener             = 200.,
     food_value           = 20.,
@@ -25,41 +69,34 @@ base_config = dict(
     energy_reproduce     = 85.,
     energy_reproduce_cost= 30.,
     infant_threshold     = 100,
-    # training
+    simple_regrowth      = True,
+    infant_eat_prop      = 1.0,
+    infant_eat_prob      = 1.0,
+    infant_move_prob     = 1.0,
     n_steps              = 500_000,
     log_every            = 500,
-    video_every          = 50_000,   # capture a clip every N steps
-    video_length         = 200,      # frames per clip
-    checkpoint_every     = 50_000,
+    video_every          = 50_000,
+    video_length         = 200,
+    checkpoint_every     = 100_000,
     checkpoint_dir       = 'checkpoints',
-    seed                 = 0,
-    # wandb
     project              = 'kin-selection',
 )
-
-# ── Ablation conditions to run ───────────────────────────
-# Add/remove rows to toggle which conditions run.
-# Start with just LSTM vs no-LSTM; uncomment others when ready.
-ablations = [
-    dict(use_lstm=True,  kin_recognition=True, proximal_reprod=True),
-    dict(use_lstm=False, kin_recognition=True, proximal_reprod=True),
-    # dict(use_lstm=True,  kin_recognition=False, proximal_reprod=True),
-    # dict(use_lstm=False, kin_recognition=False, proximal_reprod=True),
-    # dict(use_lstm=True,  kin_recognition=True,  proximal_reprod=False),
-    # dict(use_lstm=False, kin_recognition=True,  proximal_reprod=False),
-    # dict(use_lstm=True,  kin_recognition=False, proximal_reprod=False),
-    # dict(use_lstm=False, kin_recognition=False, proximal_reprod=False),
-]
 # ────────────────────────────────────────────────────────
 
 
 def run_name(cfg):
     parts = [
-        'lstm'     if cfg['use_lstm']        else 'no-lstm',
-        'kin'      if cfg['kin_recognition'] else 'no-kin',
-        'prox'     if cfg['proximal_reprod'] else 'rand-birth',
+        cfg.get('label', ''),
+        'lstm' if cfg['use_lstm'] else 'no-lstm',
+        'kin'  if cfg['kin_recognition'] else 'no-kin',
+        'prox' if cfg['proximal_reprod']  else 'rand-birth',
+        f"ep{cfg['infant_eat_prop']:.2f}",
+        f"eb{cfg['infant_eat_prob']:.2f}",
+        f"mp{cfg['infant_move_prob']:.2f}",
+        f"feed{int(cfg['feeding_transfer'])}",
+        f"s{cfg['seed']}",
     ]
-    return '_'.join(parts)
+    return '_'.join(p for p in parts if p)
 
 
 def compute_metrics(state):
@@ -67,152 +104,189 @@ def compute_metrics(state):
     n_alive = alive.sum()
     eps = 1e-10
 
-    mean_energy      = (state.agents.energy * alive).sum() / (n_alive + eps)
-    selectivity      = (
+    mean_energy       = (state.agents.energy * alive).sum() / (n_alive + eps)
+    selectivity       = (
         state.agents.n_fed_offspring / (state.agents.n_fed_total + eps)
         - state.agents.n_faced_offspring / (state.agents.n_faced_agent + eps)
     )
-    mean_selectivity  = (selectivity * alive).sum() / (n_alive + eps)
-    mean_feeding      = (state.agents.n_fed_total.astype(jnp.float32) * alive).sum() / (n_alive + eps)
-    infant_survival   = state.agents.survived_infancy.sum() / state.agents.survived_infancy.shape[0]
-    mean_nb_offspring = (state.agents.nb_offspring.astype(jnp.float32) * alive).sum() / (n_alive + eps)
 
+    fed_mask = (state.agents.n_fed_total > 0).astype(jnp.float32) * alive
+    n_feeders = fed_mask.sum()
+    mean_selectivity = (selectivity * fed_mask).sum() / (n_feeders + eps)
+    mean_feeding      = (state.agents.n_fed_total.astype(jnp.float32) * alive).sum() / (n_alive + eps)
+    infant_survival   = float(state.total_survived_infancy) / (float(state.total_born) + 1e-10)
     return {
         'population':           int(n_alive),
         'mean_energy':          float(mean_energy),
         'mean_selectivity':     float(mean_selectivity),
         'mean_feeding_events':  float(mean_feeding),
         'infant_survival_rate': float(infant_survival),
-        'mean_nb_offspring':    float(mean_nb_offspring),
     }
 
 
 def render_frame(state):
-    """Build an RGB frame from the grid state.
-    Colour scheme:
-      - white background
-      - green: food (channel 1)
-      - black: agents (channel 0)
-      - orange tint: infants (channel 3)
-    """
     grid = np.array(state.state)
-
-    rgb = np.ones((grid.shape[0], grid.shape[1], 3), dtype=np.float32)
-
-    # food → green
-    food = np.clip(grid[:, :, 1], 0, 1)
-    rgb[:, :, 0] -= food
-    rgb[:, :, 2] -= food
-
-    # agents → black
-    agents = np.clip(grid[:, :, 0], 0, 1)
-    rgb[:, :, 0] -= agents
-    rgb[:, :, 1] -= agents
-    rgb[:, :, 2] -= agents
-
-    # infants → orange tint (red channel boost, reduce blue)
+    rgb  = np.ones((grid.shape[0], grid.shape[1], 3), dtype=np.float32)
+    food    = np.clip(grid[:, :, 1], 0, 1)
+    rgb[:, :, 0] -= food;  rgb[:, :, 2] -= food
+    agents  = np.clip(grid[:, :, 0], 0, 1)
+    rgb[:, :, 0] -= agents; rgb[:, :, 1] -= agents; rgb[:, :, 2] -= agents
     infants = np.clip(grid[:, :, 3], 0, 1)
     rgb[:, :, 2] -= infants * 0.6
-
     rgb = np.clip(rgb, 0, 1)
-
-    # upscale 2x for visibility
     rgb = np.repeat(rgb, 2, axis=0)
     rgb = np.repeat(rgb, 2, axis=1)
-
     return rgb
 
 
-def save_checkpoint(state, step, name, checkpoint_dir):
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    path = os.path.join(checkpoint_dir, f"{name}_step{step}.pkl")
-    with open(path, 'wb') as f:
-        pickle.dump(state, f)
-    print(f"  checkpoint saved: {path}")
-
-
-def run_condition(cfg, ablation):
-    full_cfg = {**cfg, **ablation}
-    name = run_name(full_cfg)
-
-    wandb.init(project=full_cfg['project'], name=name, config=full_cfg, reinit=True)
+def run_condition(cfg):
+    name = run_name(cfg)
+    wandb.init(project=cfg['project'], name=name, config=cfg, reinit=True)
 
     env = Gridworld(
-        nb_agents             = full_cfg['nb_agents'],
-        SX                    = full_cfg['SX'],
-        SY                    = full_cfg['SY'],
-        init_food             = full_cfg['init_food'],
-        use_lstm              = full_cfg['use_lstm'],
-        kin_recognition       = full_cfg['kin_recognition'],
-        proximal_reprod       = full_cfg['proximal_reprod'],
-        energy_decay          = full_cfg['energy_decay'],
-        max_ener              = full_cfg['max_ener'],
-        food_value            = full_cfg['food_value'],
-        action_cost           = full_cfg['action_cost'],
-        feeding_transfer      = full_cfg['feeding_transfer'],
-        energy_reproduce      = full_cfg['energy_reproduce'],
-        energy_reproduce_cost = full_cfg['energy_reproduce_cost'],
-        infant_threshold      = full_cfg['infant_threshold'],
+        nb_agents             = cfg['nb_agents'],
+        SX                    = cfg['SX'],
+        SY                    = cfg['SY'],
+        init_food             = cfg['init_food'],
+        use_lstm              = cfg['use_lstm'],
+        kin_recognition       = cfg['kin_recognition'],
+        proximal_reprod       = cfg['proximal_reprod'],
+        energy_decay          = cfg['energy_decay'],
+        max_ener              = cfg['max_ener'],
+        food_value            = cfg['food_value'],
+        action_cost           = cfg['action_cost'],
+        feeding_transfer      = cfg['feeding_transfer'],
+        energy_reproduce      = cfg['energy_reproduce'],
+        energy_reproduce_cost = cfg['energy_reproduce_cost'],
+        infant_threshold      = cfg['infant_threshold'],
+        simple_regrowth       = cfg['simple_regrowth'],
+        infant_eat_prop       = cfg['infant_eat_prop'],
+        infant_eat_prob       = cfg['infant_eat_prob'],
+        infant_move_prob      = cfg['infant_move_prob'],
     )
 
-    key = random.PRNGKey(full_cfg['seed'])
+    key   = random.PRNGKey(cfg['seed'])
     state = env.reset(key)
 
-    print(f"\n{'='*60}")
-    print(f"Run: {name}  |  params/agent: {env.model.num_params}")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}\nRun: {name}\n{'='*60}")
 
-    vid = None
-    vid_path = None
-    vid_step = 0
+    vid = None; vid_path = None; vid_step = 0
+    metrics_history = []
 
-    for step in range(1, full_cfg['n_steps'] + 1):
+    for step in range(1, cfg['n_steps'] + 1):
         state, rewards, energy = env.step(state)
 
-        # ── video capture ──────────────────────────────────
-        if step % full_cfg['video_every'] == 1:
+        # video
+        if step % cfg['video_every'] == 1:
             vid_step = step
-            vid_path = os.path.join(
-                full_cfg['checkpoint_dir'], f"{name}_step{step}.mp4"
-            )
-            os.makedirs(full_cfg['checkpoint_dir'], exist_ok=True)
+            vid_path = os.path.join(cfg['checkpoint_dir'], f"{name}_step{step}.mp4")
+            os.makedirs(cfg['checkpoint_dir'], exist_ok=True)
             vid = VideoWriter(vid_path, fps=20.0)
-
         if vid is not None:
             vid.add(render_frame(state))
-            if (step - vid_step + 1) >= full_cfg['video_length']:
+            if (step - vid_step + 1) >= cfg['video_length']:
                 vid.close()
                 wandb.log({'video': wandb.Video(vid_path, fps=20, format='mp4')}, step=step)
                 vid = None
 
-        # ── metrics ───────────────────────────────────────
-        if step % full_cfg['log_every'] == 0:
-            metrics = compute_metrics(state)
-            wandb.log(metrics, step=step)
+        # metrics
+        if step % cfg['log_every'] == 0:
+            m = compute_metrics(state)
+            m['step'] = step
+            metrics_history.append(m)
+            wandb.log(m, step=step)
             print(
-                f"step {step:>7} | "
-                f"pop={metrics['population']:>4} | "
-                f"energy={metrics['mean_energy']:>6.1f} | "
-                f"selectivity={metrics['mean_selectivity']:>7.4f} | "
-                f"infant_surv={metrics['infant_survival_rate']:.3f}"
+                f"step {step:>7} | pop={m['population']:>4} | "
+                f"energy={m['mean_energy']:>6.1f} | "
+                f"sel={m['mean_selectivity']:>7.4f} | "
+                f"surv={m['infant_survival_rate']:.3f}"
             )
 
-        # ── checkpoint ────────────────────────────────────
-        if step % full_cfg['checkpoint_every'] == 0:
-            save_checkpoint(state, step, name, full_cfg['checkpoint_dir'])
+        # checkpoint
+        if step % cfg['checkpoint_every'] == 0:
+            ckpt = os.path.join(cfg['checkpoint_dir'], f"{name}_step{step}.pkl")
+            os.makedirs(cfg['checkpoint_dir'], exist_ok=True)
+            with open(ckpt, 'wb') as f:
+                pickle.dump(state, f)
 
-    # close any open video writer at end of run
     if vid is not None:
         vid.close()
-        wandb.log({'video': wandb.Video(vid_path, fps=20, format='mp4')}, step=full_cfg['n_steps'])
+        wandb.log({'video': wandb.Video(vid_path, fps=20, format='mp4')}, step=cfg['n_steps'])
 
-    save_checkpoint(state, full_cfg['n_steps'], name, full_cfg['checkpoint_dir'])
+    # save final state + metrics history
+    os.makedirs(cfg['checkpoint_dir'], exist_ok=True)
+    with open(os.path.join(cfg['checkpoint_dir'], f"{name}_final.pkl"), 'wb') as f:
+        pickle.dump(state, f)
+    with open(os.path.join(cfg['checkpoint_dir'], f"{name}_metrics.pkl"), 'wb') as f:
+        pickle.dump({'config': cfg, 'metrics': metrics_history}, f)
+
     wandb.finish()
 
 
+def build_conditions():
+    conditions = []
+
+    # ── 1. Paper replication sweep ───────────────────────
+    for param, overrides in SWEEP_PARAMS:
+        for val in INFANT_PARAM_VALUES:
+            for seed in SEEDS:
+                # feeding enabled
+                cfg = {**BASE_CONFIG, **overrides, param: val, 'seed': seed,
+                       'label': f'sweep-{param}'}
+                conditions.append(cfg)
+                # feeding disabled (for b̂ baseline)
+                cfg_no_feed = {**cfg, 'feeding_transfer': 0., 'label': f'nofeed-{param}'}
+                conditions.append(cfg_no_feed)
+
+    # ── 2. Ablations at default infant params ────────────
+    for abl in ABLATIONS:
+        for seed in SEEDS:
+            cfg = {**BASE_CONFIG, **abl, 'seed': seed}
+            conditions.append(cfg)
+            cfg_no_feed = {**cfg, 'feeding_transfer': 0., 'label': cfg.get('label','') + '-nofeed'}
+            conditions.append(cfg_no_feed)
+
+    return conditions
+
+
+def already_done(cfg):
+    """Return True if this run's metrics file already exists."""
+    path = os.path.join(cfg['checkpoint_dir'], f"{run_name(cfg)}_metrics.pkl")
+    return os.path.exists(path)
+
+
 def main():
-    for ablation in ablations:
-        run_condition(base_config, ablation)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint_dir', default=None,
+                        help='Override checkpoint directory (e.g. /gdrive/MyDrive/kin-selection)')
+    parser.add_argument('--start_from', type=int, default=0,
+                        help='Skip the first N conditions (useful if you know where you left off)')
+    args = parser.parse_args()
+
+    conditions = build_conditions()
+
+    # override checkpoint_dir if provided (e.g. Google Drive path)
+    if args.checkpoint_dir:
+        for cfg in conditions:
+            cfg['checkpoint_dir'] = args.checkpoint_dir
+
+    total = len(conditions)
+    skipped = 0
+    print(f"Total runs: {total}  |  starting from index {args.start_from}")
+
+    for i, cfg in enumerate(conditions):
+        if i < args.start_from:
+            continue
+        name = run_name(cfg)
+        if already_done(cfg):
+            print(f"[{i+1}/{total}] SKIP (already done): {name}")
+            skipped += 1
+            continue
+        print(f"\n[{i+1}/{total}] {name}")
+        run_condition(cfg)
+
+    print(f"\nDone. {skipped}/{total} runs skipped (already completed).")
 
 
 if __name__ == '__main__':

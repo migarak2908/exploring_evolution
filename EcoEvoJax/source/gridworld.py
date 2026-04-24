@@ -129,6 +129,17 @@ def get_init_state_fn(key: jnp.ndarray, SX, SY, posx, posy, pos_food_x, pos_food
 
 get_obs_vector = jax.vmap(get_ob, in_axes=(None, 0, 0), out_axes=0)
 
+def rotate_obs(obs, orientation):
+    return jax.lax.switch(orientation,
+                          [
+                              lambda o: o,
+                              lambda o: jnp.rot90(o, k=1),
+                              lambda o: jnp.rot90(o, k=2),
+                              lambda o: jnp.rot90(o, k=3)
+                           ],
+                          obs)
+
+rotate_obs_vmap = jax.vmap(rotate_obs)
 
 class Gridworld(VectorizedTask):
     """gridworld task."""
@@ -158,7 +169,7 @@ class Gridworld(VectorizedTask):
                  action_cost: float = 1.0,
                  max_ener=200.,
                  regrowth_scale=0.002,
-                 niches_scale=200,
+                 niches_scale=1.1,
                  spontaneous_regrow=1 / 200000,
                  simple_regrowth=True,
                  wall_kill=True,
@@ -297,6 +308,8 @@ class Gridworld(VectorizedTask):
             obs = raw_obs.at[:, :, :, 4].set(is_offspring)
             if not self.kin_recognition:
                 obs = obs.at[:, :, :, 4].set(0)
+            obs = rotate_obs_vmap(obs, orientation)
+
 
             return State(state=grid, obs=obs, last_actions=jnp.zeros((self.nb_agents, NUM_ACTIONS)),
                          rewards=jnp.zeros((self.nb_agents, 1)), agents=agents,
@@ -310,7 +323,8 @@ class Gridworld(VectorizedTask):
                       nb_offspring, action_int, uid, parent_id, next_uid, grid, n_fed_total, n_fed_offspring, n_faced_offspring,
                       n_faced_agent, survived_infancy):
 
-            reproducer_mask = (energy >= self.energy_reproduce) * action_int[:, 6] * (alive > 0)
+            is_infant = time_alive < self.infant_threshold
+            reproducer_mask = (energy >= self.energy_reproduce) * action_int[:, 6] * (alive > 0) * (~is_infant).astype(jnp.int32)
             reproducer_mask = reproducer_mask * (alive.sum() < self.nb_agents).astype(jnp.int32)
             dead_mask = (1 - alive)
 
@@ -354,7 +368,7 @@ class Gridworld(VectorizedTask):
             n_births = is_filled.sum()
 
             parent_uid = uid[parent_idx]
-            offspring_uid = next_uid + jnp.where(is_filled, jnp.cumsum(is_filled) - 1, 0)
+            offspring_uid = next_uid + jnp.where(is_filled, jnp.cumsum(is_filled) - 1, 0).astype(jnp.uint32)
             uid = jnp.where(is_filled, offspring_uid, uid)
             parent_id = jnp.where(is_filled, parent_uid, parent_id)
             next_uid = next_uid + n_births.astype(jnp.uint32)
@@ -366,7 +380,7 @@ class Gridworld(VectorizedTask):
 
             posx = jnp.where(is_filled, offspring_x, posx)
             posy = jnp.where(is_filled, offspring_y, posy)
-            energy = jnp.where(is_filled, self.max_ener, energy)
+            energy = jnp.where(is_filled, self.energy_reproduce, energy)
             time_good_level = jnp.where(is_filled, 0, time_good_level)
             alive = jnp.where(is_filled, 1, alive)
             time_alive = jnp.where(is_filled, 0, time_alive)
@@ -512,8 +526,9 @@ class Gridworld(VectorizedTask):
             next_key, key = random.split(key)
 
             if self.simple_regrowth:
-                regrow_prob = jnp.where(num_neighbs > 0, 0.003, 0.)
+                regrow_prob = jnp.where(num_neighbs > 0, 0.00003, self.spontaneous_regrow)
                 grid = grid.at[:, :, 1].add(random.bernoulli(next_key, regrow_prob))
+                grid = grid.at[:, :, 1].set(jnp.clip(grid[:, :, 1], 0, 1))
 
             else:
                 if scale_constant:
@@ -556,7 +571,7 @@ class Gridworld(VectorizedTask):
             grid = grid.at[:, :, 3].set(jnp.clip(grid[:, :, 3], 0, 1))
 
             # compute reproducer and go through the function only if there is one
-            reproducer = jnp.where(energy >= self.energy_reproduce, 1, 0) * action_int[:, 6]
+            reproducer = jnp.where(energy >= self.energy_reproduce, 1, 0) * action_int[:, 6] * (~is_infant).astype(jnp.int32)
             uid, parent_id, next_uid = state.agents.uid, state.agents.parent_id, state.next_uid.astype(jnp.uint32)
             next_key, key = random.split(key)
 
@@ -598,6 +613,7 @@ class Gridworld(VectorizedTask):
             obs = raw_obs.at[:, :, :, 4].set(is_offspring)
             if not self.kin_recognition:
                 obs = obs.at[:, :, :, 4].set(0)
+            obs = rotate_obs_vmap(obs, orientation)
 
             cur_state = State(state=grid, obs=obs, last_actions=actions,
                               rewards=jnp.expand_dims(rewards, -1),
