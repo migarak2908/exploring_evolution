@@ -170,7 +170,7 @@ def main(cfg):
             vid.add(render_frame(state))
             if (step - vid_step + 1) >= cfg['video_length']:
                 vid.close()
-                wandb.log({'video': wandb.Video(vid_path, fps=20, format='mp4')}, step=step)
+                wandb.log({f'video_step{step}': wandb.Video(vid_path, fps=20, format='mp4')}, step=step)
                 vid = None
 
         # ── metrics ───────────────────────────────────────
