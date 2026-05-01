@@ -156,11 +156,21 @@ def main(cfg):
     vid_step = 0
     metrics_history = []
 
-    for step in range(1, cfg['n_steps'] + 1):
-        state, rewards, energy = env.step(state)
+    @jax.jit
+    def run_chunk(state):
+        def scan_step(state, _):
+            state, _, _ = env.step(state)
+            return state, None
+        state, _ = jax.lax.scan(scan_step, state, None, length=cfg['log_every'])
+        return state
+
+    n_chunks = cfg['n_steps'] // cfg['log_every']
+    for chunk in range(1, n_chunks + 1):
+        state = run_chunk(state)
+        step = chunk * cfg['log_every']
 
         # ── video capture ──────────────────────────────────
-        if step % cfg['video_every'] == 1:
+        if step % cfg['video_every'] < cfg['log_every']:
             vid_step = step
             vid_path = os.path.join(cfg['checkpoint_dir'], f"{name}_step{step}.mp4")
             os.makedirs(cfg['checkpoint_dir'], exist_ok=True)
@@ -174,18 +184,17 @@ def main(cfg):
                 vid = None
 
         # ── metrics ───────────────────────────────────────
-        if step % cfg['log_every'] == 0:
-            metrics = compute_metrics(state)
-            metrics['step'] = step
-            metrics_history.append(metrics)
-            wandb.log(metrics, step=step)
-            print(
-                f"step {step:>7} | "
-                f"pop={metrics['population']:>4} | "
-                f"energy={metrics['mean_energy']:>6.1f} | "
-                f"selectivity={metrics['mean_selectivity']:>7.4f} | "
-                f"infant_surv={metrics['infant_survival_rate']:.3f}"
-            )
+        metrics = compute_metrics(state)
+        metrics['step'] = step
+        metrics_history.append(metrics)
+        wandb.log(metrics, step=step)
+        print(
+            f"step {step:>7} | "
+            f"pop={metrics['population']:>4} | "
+            f"energy={metrics['mean_energy']:>6.1f} | "
+            f"selectivity={metrics['mean_selectivity']:>7.4f} | "
+            f"infant_surv={metrics['infant_survival_rate']:.3f}"
+        )
 
         # ── checkpoint ────────────────────────────────────
         if step % cfg['checkpoint_every'] == 0:
